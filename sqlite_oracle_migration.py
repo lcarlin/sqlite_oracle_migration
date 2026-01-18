@@ -60,7 +60,19 @@ class MigrationTool:
             print(f"  • Oracle User: {self.config['ORACLE']['user']}")
             print(f"  • Oracle Host: {self.config['ORACLE']['host']}")
             print(f"  • Oracle Port: {self.config['ORACLE']['port']}")
-            print(f"  • Oracle SID: {self.config['ORACLE']['sid']}")
+            
+            # Exibir SID ou Service Name
+            service_name = self.config['ORACLE'].get('service_name', None)
+            sid = self.config['ORACLE'].get('sid', None)
+            
+            if service_name:
+                print(f"  • Oracle Service Name: {service_name}")
+            if sid:
+                print(f"  • Oracle SID: {sid}")
+            
+            if not service_name and not sid:
+                print("  ⚠ AVISO: Nenhum 'service_name' ou 'sid' configurado!")
+                print("  Configure um deles na seção [ORACLE]")
             
             self.mode = self.config['MIGRATION'].get('mode', 'append').lower()
             self.batch_size = int(self.config['MIGRATION'].get('batch_size', '1000'))
@@ -93,27 +105,83 @@ class MigrationTool:
             return False
     
     def connect_oracle(self) -> bool:
-        """Conecta ao banco Oracle"""
+        """Conecta ao banco Oracle (suporta SID e Service Name)"""
         print(f"\n[3/7] Conectando ao Oracle...")
-        try:
-            dsn = cx_Oracle.makedsn(
-                self.config['ORACLE']['host'],
-                self.config['ORACLE']['port'],
-                sid=self.config['ORACLE']['sid']
-            )
-            
-            self.oracle_conn = cx_Oracle.connect(
-                user=self.config['ORACLE']['user'],
-                password=self.config['ORACLE']['password'],
-                dsn=dsn,
-                encoding="UTF-8"
-            )
-            
-            print(f"✓ Conectado ao Oracle: {self.config['ORACLE']['user']}@{self.config['ORACLE']['sid']}")
-            return True
-        except Exception as e:
-            print(f"ERRO ao conectar Oracle: {str(e)}")
+        
+        host = self.config['ORACLE']['host']
+        port = self.config['ORACLE']['port']
+        user = self.config['ORACLE']['user']
+        password = self.config['ORACLE']['password']
+        
+        # Verificar se existe service_name ou sid no config
+        service_name = self.config['ORACLE'].get('service_name', None)
+        sid = self.config['ORACLE'].get('sid', None)
+        
+        # Validar que pelo menos um está configurado
+        if not service_name and not sid:
+            print("ERRO: Configure 'service_name' OU 'sid' na seção [ORACLE]")
             return False
+        
+        # Tentar conexão com Service Name (prioridade)
+        if service_name:
+            try:
+                print(f"  • Tentando conexão com Service Name: {service_name}")
+                dsn = cx_Oracle.makedsn(
+                    host,
+                    port,
+                    service_name=service_name
+                )
+                
+                self.oracle_conn = cx_Oracle.connect(
+                    user=user,
+                    password=password,
+                    dsn=dsn,
+                    encoding="UTF-8"
+                )
+                
+                print(f"✓ Conectado ao Oracle: {user}@{service_name} (Service Name)")
+                return True
+                
+            except cx_Oracle.DatabaseError as e:
+                error_obj, = e.args
+                print(f"  ✗ Falha com Service Name: {error_obj.message}")
+                
+                # Se SID também está configurado, tentar como fallback
+                if sid:
+                    print(f"  • Tentando fallback com SID: {sid}")
+                else:
+                    print(f"ERRO ao conectar Oracle: {error_obj.message}")
+                    return False
+        
+        # Tentar conexão com SID
+        if sid:
+            try:
+                if not service_name:  # Só exibe se não tentou service_name antes
+                    print(f"  • Tentando conexão com SID: {sid}")
+                
+                dsn = cx_Oracle.makedsn(
+                    host,
+                    port,
+                    sid=sid
+                )
+                
+                self.oracle_conn = cx_Oracle.connect(
+                    user=user,
+                    password=password,
+                    dsn=dsn,
+                    encoding="UTF-8"
+                )
+                
+                print(f"✓ Conectado ao Oracle: {user}@{sid} (SID)")
+                return True
+                
+            except cx_Oracle.DatabaseError as e:
+                error_obj, = e.args
+                print(f"  ✗ Falha com SID: {error_obj.message}")
+                print(f"\nERRO ao conectar Oracle: {error_obj.message}")
+                return False
+        
+        return False
     
     def normalize_name(self, name: str) -> str:
         """Normaliza nome de tabela/coluna"""
@@ -391,7 +459,23 @@ user = system
 password = oracle
 host = localhost
 port = 1521
-sid = XE
+
+# IMPORTANTE: Configure service_name OU sid (não ambos)
+#
+# Service Name (RECOMENDADO - mais moderno)
+# Usado em Oracle Cloud, RAC, PDB (Pluggable Database)
+# Exemplos: XEPDB1, orcl, myservice.example.com
+service_name = XEPDB1
+
+# SID (tradicional)
+# Usado em Oracle XE antigo, instalações standalone
+# Exemplos: XE, ORCL
+# sid = XE
+
+# Como descobrir qual usar:
+# 1. SQL*Plus: SELECT value FROM v$parameter WHERE name = 'service_names';
+# 2. Listener: lsnrctl status
+# 3. tnsnames.ora: Procure SERVICE_NAME ou SID
 
 [MIGRATION]
 # Modo de migração: 'append' (adicionar) ou 'truncate' (recriar)
@@ -407,8 +491,20 @@ batch_size = 1000
     with open('migration.cfg', 'w', encoding='utf-8') as f:
         f.write(config_content)
     
-    print("Arquivo de configuração 'migration.cfg' criado com sucesso!")
-    print("Edite o arquivo antes de executar a migração.")
+    print("=" * 80)
+    print("Arquivo 'migration.cfg' criado com sucesso!")
+    print("=" * 80)
+    print("\n⚠️  IMPORTANTE: Configure service_name OU sid")
+    print("\nPara descobrir qual usar:")
+    print("  1. Via SQL*Plus:")
+    print("     SELECT value FROM v$parameter WHERE name = 'service_names';")
+    print("\n  2. Via Listener:")
+    print("     lsnrctl status")
+    print("\n  3. Teste sua conexão:")
+    print("     sqlplus usuario/senha@//localhost:1521/XEPDB1  (Service Name)")
+    print("     sqlplus usuario/senha@localhost:1521:XE        (SID)")
+    print("\nEdite o arquivo migration.cfg antes de executar a migração.")
+    print("=" * 80)
 
 
 if __name__ == "__main__":
@@ -419,3 +515,4 @@ if __name__ == "__main__":
     tool = MigrationTool()
     success = tool.run()
     sys.exit(0 if success else 1)
+

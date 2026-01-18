@@ -966,3 +966,8 @@ SIZE 1G AUTOEXTEND ON;
    ALTER INDEX idx_nome UNUSABLE;
    -- Migrar
    ALTER INDEX idx_nome REBUILD
+
+   [Luiz Antonio Carlin]
+   [luiz.carlin@gmail.com]
+   [https://www.linkedin.com/in/luizcarlin/]
+   [@lcarlin]
