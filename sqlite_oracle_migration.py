@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SQLite to Oracle Migration Tool
+SQLite to Oracle Migration Tool - Version 14
 Migrates data from SQLite database to Oracle Database (XE)
 """
 
@@ -8,9 +8,10 @@ import sqlite3
 import configparser
 import sys
 import os
+import re
+import time
 from datetime import datetime
 from typing import List, Tuple, Dict, Any
-import time
 
 try:
     import cx_Oracle
@@ -31,11 +32,12 @@ class MigrationTool:
         self.mode = None
         self.batch_size = 1000
         self.normalize_names = True
+        self.debug_mode = False
         
     def load_config(self) -> bool:
         """Carrega arquivo de configuração"""
         print("=" * 80)
-        print("SQLITE TO ORACLE MIGRATION TOOL")
+        print("SQLITE TO ORACLE MIGRATION TOOL - v14")
         print("=" * 80)
         print(f"\n[1/7] Carregando configurações de '{self.config_file}'...")
         
@@ -77,10 +79,13 @@ class MigrationTool:
             self.mode = self.config['MIGRATION'].get('mode', 'append').lower()
             self.batch_size = int(self.config['MIGRATION'].get('batch_size', '1000'))
             self.normalize_names = self.config['MIGRATION'].getboolean('normalize_names', True)
+            self.debug_mode = self.config['MIGRATION'].getboolean('debug_mode', False)
             
             print(f"  • Modo de migração: {self.mode.upper()}")
             print(f"  • Normalizar nomes: {'SIM (espaços → underscores)' if self.normalize_names else 'NÃO'}")
             print(f"  • Tamanho do lote: {self.batch_size} registros")
+            if self.debug_mode:
+                print(f"  • Modo DEBUG: ATIVADO")
             
             return True
             
@@ -198,46 +203,153 @@ class MigrationTool:
         print(f"✓ Encontradas {len(tables)} tabelas no SQLite")
         return tables
     
+    def extract_column_type_from_ddl(self, ddl: str, column_name: str) -> str:
+        """Extrai o tipo exato de uma coluna do DDL"""
+        if not ddl:
+            return None
+        
+        # Remover comentários e quebras de linha extras
+        ddl_clean = re.sub(r'--.*$', '', ddl, flags=re.MULTILINE)
+        ddl_clean = ' '.join(ddl_clean.split())
+        
+        # Pattern para encontrar a definição da coluna
+        # Procura: nome_coluna TIPO(params) ou nome_coluna TIPO
+        # Suporta espaços e variações de case
+        pattern = rf'\b{re.escape(column_name)}\s+([A-Z][A-Z0-9_]*(?:\s*\([^)]+\))?)'
+        
+        match = re.search(pattern, ddl_clean, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        
+        return None
+    
     def get_table_info(self, table_name: str) -> Tuple[List[Tuple], int]:
         """Obtém informações da tabela SQLite"""
         cursor = self.sqlite_conn.cursor()
         
-        # Informações das colunas
+        # Informações das colunas via PRAGMA (básico)
         cursor.execute(f'PRAGMA table_info("{table_name}")')
-        columns = cursor.fetchall()
+        pragma_columns = cursor.fetchall()
+        
+        # Obter DDL real da tabela para tipos precisos
+        cursor.execute(f"""
+            SELECT sql FROM sqlite_master 
+            WHERE type='table' AND name='{table_name}'
+        """)
+        ddl_result = cursor.fetchone()
+        ddl = ddl_result[0] if ddl_result else None
+        
+        # Enriquecer informações com tipos do DDL
+        enhanced_columns = []
+        for col in pragma_columns:
+            col_name = col[1]
+            # Tentar extrair tipo real do DDL
+            real_type = self.extract_column_type_from_ddl(ddl, col_name) if ddl else None
+            
+            # col é uma tupla: (cid, name, type, notnull, dflt_value, pk)
+            # Substituir type (índice 2) pelo tipo real se encontrado
+            if real_type:
+                col_list = list(col)
+                col_list[2] = real_type
+                enhanced_columns.append(tuple(col_list))
+            else:
+                enhanced_columns.append(col)
         
         # Contagem de registros
         cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
         count = cursor.fetchone()[0]
         
-        return columns, count
+        return enhanced_columns, count
     
     def map_sqlite_to_oracle_type(self, sqlite_type: str) -> str:
-        """Mapeia tipos SQLite para Oracle"""
-        sqlite_type = sqlite_type.upper()
+        """Mapeia tipos SQLite para Oracle (preservando precisão e escala)"""
+        if not sqlite_type:
+            return 'VARCHAR2(4000)'
         
-        type_map = {
-            'INTEGER': 'NUMBER',
-            'INT': 'NUMBER',
-            'REAL': 'NUMBER',
-            'FLOAT': 'NUMBER',
-            'DOUBLE': 'NUMBER',
-            'TEXT': 'VARCHAR2(4000)',
-            'VARCHAR': 'VARCHAR2(4000)',
-            'CHAR': 'VARCHAR2(4000)',
-            'BLOB': 'BLOB',
+        sqlite_type_upper = sqlite_type.upper().strip()
+        
+        # Mapeamento direto para tipos já compatíveis com Oracle
+        direct_map = {
             'DATE': 'DATE',
-            'DATETIME': 'TIMESTAMP',
             'TIMESTAMP': 'TIMESTAMP',
-            'BOOLEAN': 'NUMBER(1)',
-            'NUMERIC': 'NUMBER'
+            'BLOB': 'BLOB',
+            'CLOB': 'CLOB',
+            'RAW': 'RAW'
         }
         
-        for key, value in type_map.items():
-            if key in sqlite_type:
+        # Verificar mapeamento direto
+        for key, value in direct_map.items():
+            if sqlite_type_upper == key:
                 return value
         
-        return 'VARCHAR2(4000)'  # Default
+        # NUMBER com precisão e escala: NUMBER(9), NUMBER(11,2), etc.
+        number_match = re.match(r'NUMBER\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)', sqlite_type_upper)
+        if number_match:
+            precision = number_match.group(1)
+            scale = number_match.group(2)
+            if scale:
+                return f'NUMBER({precision},{scale})'
+            else:
+                return f'NUMBER({precision})'
+        
+        # NUMBER genérico
+        if sqlite_type_upper == 'NUMBER' or sqlite_type_upper == 'NUMERIC':
+            return 'NUMBER'
+        
+        # INTEGER e variações
+        if sqlite_type_upper in ('INTEGER', 'INT', 'SMALLINT', 'BIGINT', 'TINYINT', 'MEDIUMINT'):
+            return 'NUMBER'
+        
+        # REAL, FLOAT, DOUBLE
+        if sqlite_type_upper in ('REAL', 'FLOAT', 'DOUBLE', 'DOUBLE PRECISION'):
+            return 'NUMBER'
+        
+        # DECIMAL com precisão
+        decimal_match = re.match(r'DECIMAL\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)', sqlite_type_upper)
+        if decimal_match:
+            precision = decimal_match.group(1)
+            scale = decimal_match.group(2)
+            if scale:
+                return f'NUMBER({precision},{scale})'
+            else:
+                return f'NUMBER({precision})'
+        
+        # VARCHAR2 já definido no SQLite (Oracle syntax em SQLite)
+        varchar2_match = re.match(r'VARCHAR2\s*\(\s*(\d+)\s*\)', sqlite_type_upper)
+        if varchar2_match:
+            size = varchar2_match.group(1)
+            return f'VARCHAR2({size})'
+        
+        # VARCHAR com tamanho
+        varchar_match = re.match(r'VARCHAR\s*\(\s*(\d+)\s*\)', sqlite_type_upper)
+        if varchar_match:
+            size = varchar_match.group(1)
+            return f'VARCHAR2({size})'
+        
+        # CHAR com tamanho
+        char_match = re.match(r'CHAR\s*\(\s*(\d+)\s*\)', sqlite_type_upper)
+        if char_match:
+            size = char_match.group(1)
+            return f'CHAR({size})'
+        
+        # TEXT, VARCHAR genérico, STRING
+        if sqlite_type_upper in ('TEXT', 'VARCHAR', 'STRING', 'NVARCHAR', 'NTEXT'):
+            return 'VARCHAR2(4000)'
+        
+        # CHAR genérico
+        if sqlite_type_upper == 'CHAR':
+            return 'CHAR(1)'
+        
+        # BOOLEAN
+        if sqlite_type_upper in ('BOOLEAN', 'BOOL'):
+            return 'NUMBER(1)'
+        
+        # DATETIME
+        if sqlite_type_upper == 'DATETIME':
+            return 'TIMESTAMP'
+        
+        # Default: VARCHAR2(4000) para tipos não reconhecidos
+        return 'VARCHAR2(4000)'
     
     def create_oracle_table(self, table_name: str, columns: List[Tuple]) -> bool:
         """Cria tabela no Oracle"""
@@ -268,11 +380,18 @@ class MigrationTool:
             col_defs = []
             for col in columns:
                 col_name = self.normalize_name(col[1])
-                col_type = self.map_sqlite_to_oracle_type(col[2] if col[2] else 'TEXT')
-                nullable = "" if col[3] == 0 else ""  # Oracle permite NULL por padrão
-                col_defs.append(f"{col_name} {col_type}")
+                sqlite_type = col[2] if col[2] else 'TEXT'
+                oracle_type = self.map_sqlite_to_oracle_type(sqlite_type)
+                col_defs.append(f"{col_name} {oracle_type}")
+                
+                if self.debug_mode:
+                    print(f"      {col_name}: {sqlite_type} → {oracle_type}")
             
             create_sql = f"CREATE TABLE {oracle_table_name} ({', '.join(col_defs)})"
+            
+            if self.debug_mode:
+                print(f"      SQL: {create_sql}")
+            
             cursor.execute(create_sql)
             self.oracle_conn.commit()
             
@@ -280,6 +399,9 @@ class MigrationTool:
             
         except Exception as e:
             print(f"    ERRO ao criar tabela: {str(e)}")
+            if self.debug_mode:
+                import traceback
+                traceback.print_exc()
             return False
     
     def show_progress_bar(self, current: int, total: int, bar_length: int = 50):
@@ -289,7 +411,35 @@ class MigrationTool:
         bar = '█' * filled + '░' * (bar_length - filled)
         print(f"\r    [{bar}] {percent*100:.1f}% ({current:,}/{total:,})", end='', flush=True)
     
-    def migrate_table_data(self, table_name: str) -> bool:
+    def parse_date(self, date_str: str):
+        """Converte string de data para objeto datetime Python"""
+        if not date_str:
+            return None
+        
+        # Formatos comuns de data no SQLite
+        date_formats = [
+            '%Y-%m-%d',              # 2024-01-15
+            '%Y-%m-%d %H:%M:%S',     # 2024-01-15 14:30:00
+            '%Y-%m-%d %H:%M:%S.%f',  # 2024-01-15 14:30:00.123
+            '%d/%m/%Y',              # 15/01/2024
+            '%d/%m/%Y %H:%M:%S',     # 15/01/2024 14:30:00
+            '%Y/%m/%d',              # 2024/01/15
+            '%Y/%m/%d %H:%M:%S',     # 2024/01/15 14:30:00
+            '%d-%m-%Y',              # 15-01-2024
+            '%d-%m-%Y %H:%M:%S',     # 15-01-2024 14:30:00
+        ]
+        
+        for fmt in date_formats:
+            try:
+                return datetime.strptime(date_str, fmt)
+            except (ValueError, TypeError):
+                continue
+        
+        # Se nenhum formato funcionar, retornar string original
+        # Oracle tentará converter
+        return date_str
+    
+    def migrate_table_data(self, table_name: str, column_types: List[str]) -> bool:
         """Migra dados de uma tabela"""
         oracle_table_name = self.normalize_name(table_name)
         
@@ -324,11 +474,18 @@ class MigrationTool:
             for row in cursor_sqlite:
                 # Converter tipos especiais
                 converted_row = []
-                for val in row:
-                    if isinstance(val, bytes):
-                        converted_row.append(val)
-                    elif val is None:
+                for idx, val in enumerate(row):
+                    if val is None:
                         converted_row.append(None)
+                    elif isinstance(val, bytes):
+                        # BLOB - manter como está
+                        converted_row.append(val)
+                    elif column_types[idx].upper() in ('DATE', 'TIMESTAMP'):
+                        # Converter strings de data para objetos datetime
+                        if isinstance(val, str):
+                            converted_row.append(self.parse_date(val))
+                        else:
+                            converted_row.append(val)
                     else:
                         converted_row.append(val)
                 
@@ -354,6 +511,9 @@ class MigrationTool:
             
         except Exception as e:
             print(f"\n    ERRO: {str(e)}")
+            if self.debug_mode:
+                import traceback
+                traceback.print_exc()
             return False
     
     def migrate(self) -> bool:
@@ -392,9 +552,16 @@ class MigrationTool:
             oracle_name = self.normalize_name(table)
             count = table_info[table]['count']
             
+            # Extrair tipos Oracle das colunas para conversão
+            oracle_types = []
+            for col in table_info[table]['columns']:
+                sqlite_type = col[2] if col[2] else 'TEXT'
+                oracle_type = self.map_sqlite_to_oracle_type(sqlite_type)
+                oracle_types.append(oracle_type)
+            
             print(f"\n  [{idx}/{len(tables)}] {table} → {oracle_name} ({count:,} registros)")
             
-            if self.migrate_table_data(table):
+            if self.migrate_table_data(table, oracle_types):
                 total_migrated += count
             else:
                 print(f"    ✗ Falha na migração")
@@ -407,7 +574,8 @@ class MigrationTool:
         print(f"  • Tabelas migradas: {len(tables)}")
         print(f"  • Total de registros: {total_migrated:,}")
         print(f"  • Tempo decorrido: {elapsed:.2f} segundos")
-        print(f"  • Registros/segundo: {total_migrated/elapsed:,.0f}")
+        if elapsed > 0:
+            print(f"  • Registros/segundo: {total_migrated/elapsed:,.0f}")
         print("=" * 80)
         
         return True
@@ -440,8 +608,9 @@ class MigrationTool:
             return False
         except Exception as e:
             print(f"\n\nERRO FATAL: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            if self.debug_mode:
+                import traceback
+                traceback.print_exc()
             return False
         finally:
             self.close_connections()
@@ -486,6 +655,11 @@ normalize_names = true
 
 # Tamanho do lote para inserções
 batch_size = 1000
+
+# Modo debug (exibe informações detalhadas de tipos e SQL)
+# true = mostra mapeamento de tipos e comandos SQL
+# false = modo normal (recomendado)
+debug_mode = false
 """
     
     with open('migration.cfg', 'w', encoding='utf-8') as f:
@@ -516,3 +690,4 @@ if __name__ == "__main__":
     success = tool.run()
     sys.exit(0 if success else 1)
 
+## EOP => End Of Program 

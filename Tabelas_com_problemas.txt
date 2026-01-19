@@ -1,3 +1,0 @@
-Tarot_Decks
-Financ_NuBank_2025
-HistoricoGeral → HISTORICOGERAL...    ERRO ao criar tabela: ORA-01748: only simple column names allowed here
